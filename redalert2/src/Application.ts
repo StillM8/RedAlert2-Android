@@ -30,6 +30,8 @@ import { browserFileSystemAccess } from './engine/gameRes/browserFileSystemAcces
 import type { TestToolRuntimeContext } from './tools/TestToolSupport';
 import { attachPerformanceOptions, installPerformanceDebugApi } from './performance/PerformanceRuntime';
 import { inGameViewportActive } from './gui/inGameViewport';
+import { getNativeShellEngine, getNativeShellProfile, isNativeShell } from './shell/nativeShell';
+import type { GameProfileId } from './engine/GameProfile';
 
 const optionalDevModuleImporters: Record<string, () => Promise<any>> = {
     './tools/VxlTester': () => import('./tools/VxlTester'),
@@ -168,6 +170,13 @@ export class Application {
             const iniFileInstance = new IniFile(iniString);
             this.config = new Config();
             this.config.load(iniFileInstance);
+            const shellEngine = isNativeShell() ? getNativeShellEngine() : undefined;
+            const persistedEngine = isNativeShell() ? localStorage.getItem('_ra2_native_engine') : null;
+            const nativeEngine = shellEngine ?? (persistedEngine === 'yr' ? 'yr' : persistedEngine === 'ra2' ? 'ra2' : undefined);
+            if (nativeEngine === 'ra2' || nativeEngine === 'yr') {
+                this.config.getGeneralData().set('engine', nativeEngine);
+                console.log(`[Application] Native shell selected ${nativeEngine} engine${shellEngine ? ' from the Android app variant' : ' from imported archives'}.`);
+            }
             console.log('[Application] config.ini loaded and parsed successfully.');
             console.log('[Application] Config object dump:', this.config);
             console.log('[Application] Verification: Default Locale from config:', this.config.defaultLocale);
@@ -238,6 +247,59 @@ export class Application {
         console.log('[Application] Sample string GUI:Cancel ->', this.strings.get('GUI:Cancel'));
         console.log('[Application] Sample string GUI:LoadingEx ->', this.strings.get('GUI:LoadingEx'));
         console.log('[Application] First 20 keys in Strings:', this.strings.getKeys().slice(0, 20));
+    }
+    /**
+     * On the native shell the retail CSF is inside language.mix/langmd.mix,
+     * so it cannot be fetched as /generalmd.csf before GameRes has initialized
+     * the VFS. Merge that CSF now, before Gui is constructed. JSON translations
+     * remain authoritative for keys that the web UI already provides.
+     */
+    private loadGameStringsFromVfs(): void {
+        const vfs = Engine.vfs;
+        if (!vfs || !this.strings) {
+            return;
+        }
+        const isYuri = Engine.getActiveEngine() === EngineType.YurisRevenge;
+        const candidates = isYuri
+            ? ['ra2md.csf', 'generalmd.csf', 'stringtable00.csf', 'stringtable01.csf', 'ra2.csf']
+            : ['ra2.csf', 'general.csf'];
+        let loadedCsf = false;
+        for (const fileName of candidates) {
+            if (!vfs.fileExists(fileName)) {
+                continue;
+            }
+            try {
+                const csf = new CsfFile(vfs.openFile(fileName));
+                let added = 0;
+                for (const [key, value] of Object.entries(csf.data)) {
+                    if (!this.strings.has(key)) {
+                        this.strings.setValue(key, value);
+                        added++;
+                    }
+                }
+                console.log(`[Application] Merged ${added} missing strings from VFS CSF "${fileName}" (${Object.keys(csf.data).length} labels).`);
+                loadedCsf = true;
+            }
+            catch (error) {
+                console.warn(`[Application] Failed to parse VFS CSF "${fileName}":`, error);
+            }
+        }
+        // Keep the most visible native labels readable even when a custom
+        // resource set omits its language archive.
+        for (const [key, value] of Object.entries({
+            'GUI:Options': 'Options',
+            'GUI:Optionss': 'Options',
+            'TXT_READY': 'Ready',
+            'TXT_HOLD': 'Hold',
+            'TXT_PRIMARY': 'Primary',
+        })) {
+            if (!this.strings.has(key)) {
+                this.strings.setValue(key, value);
+            }
+        }
+        if (!loadedCsf) {
+            console.warn('[Application] No readable retail CSF found in the VFS; using built-in label fallbacks.');
+        }
     }
     private checkGlobalLibs(): void {
         console.log('[MVP] Skipping Application.checkGlobalLibs().');
@@ -557,11 +619,15 @@ export class Application {
             .catch(e => this.sentry?.captureException(e));
         this.fsAccessLib = browserFileSystemAccess;
         const urlParams = new URLSearchParams(window.location.search);
-        const modName = urlParams.get('mod');
+        const requestedModName = urlParams.get('mod');
+        const nativeShellProfile = isNativeShell() ? getNativeShellProfile() : undefined;
+        const profile: GameProfileId = nativeShellProfile ?? (this.config.engine === 'yr' ? 'yr' : 'ra2');
+        const modName = requestedModName;
         let gameResConfig = this.loadGameResConfig(this.localPrefs);
         try {
-            const gameRes = new GameRes(this.getVersion(), modName || undefined, this.fsAccessLib, this.localPrefs, this.strings, this.rootEl, this.createSplashScreenInterface(), this.viewportAdapter, this.config, "res/", this.sentry);
+            const gameRes = new GameRes(this.getVersion(), modName || undefined, this.fsAccessLib, this.localPrefs, this.strings, this.rootEl, this.createSplashScreenInterface(), this.viewportAdapter, this.config, "res/", this.sentry, profile);
             const { configToPersist, cdnResLoader } = await gameRes.init(gameResConfig, (error, strings) => this.handleGameResLoadError(error, strings), (error, strings) => this.handleGameResImportError(error, strings));
+            this.loadGameStringsFromVfs();
             try {
                 const vfsAny: any = (Engine as any).vfs;
                 if (vfsAny?.debugListFileOwners) {

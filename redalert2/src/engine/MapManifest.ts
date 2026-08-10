@@ -39,8 +39,13 @@ export class MapManifest {
         if (!basicSection) {
             throw new Error(`Map "${mapFileName}" is missing the [Basic] section after parsing`);
         }
+        // Keep the relative path in fileName so MapFileLoader can resolve
+        // maps shipped below nested mod directories. Use
+        // only the leaf name for the fallback UI label so long mod paths do
+        // not spill out of the map picker.
         this.fileName = mapFileName;
-        this.uiName = "NOSTR:" + (basicSection.getString("Name") || mapFileName.replace(/\.[^.]+$/, ""));
+        const mapLeafName = mapFileName.split('/').pop() || mapFileName;
+        this.uiName = "NOSTR:" + (basicSection.getString("Name") || mapLeafName.replace(/\.[^.]+$/, ""));
         const waypointsSectionContent = this.extractIniSection("Waypoints", mapContent);
         let maxPlayersFromWaypoints = 0;
         if (waypointsSectionContent) {
@@ -52,8 +57,14 @@ export class MapManifest {
         }
         this.maxSlots = maxPlayersFromWaypoints;
         this.official = basicSection.getBool("Official");
-        const supportedModeFilters = basicSection.getArray("GameMode", /,\s*/, ["standard"]);
-        this.gameModes = availableGameModes.filter((gm) => supportedModeFilters.includes(gm.mapFilter));
+        // Map authors commonly write "Standard" while the engine's mode
+        // catalog stores the filter as "standard". Treat this metadata as
+        // case-insensitive so mod maps are usable in
+        // the skirmish and LAN map pickers.
+        const supportedModeFilters = basicSection
+            .getArray("GameMode", /,\s*/, ["standard"])
+            .map((filter) => filter.toLowerCase());
+        this.gameModes = availableGameModes.filter((gm) => supportedModeFilters.includes(gm.mapFilter.toLowerCase()));
         return this;
     }
     private extractIniSection(sectionName: string, content: string): string | undefined {

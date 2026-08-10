@@ -1,13 +1,16 @@
 import { sleep } from "@/util/time";
-import { IOError } from "data/vfs/IOError";
+import { IOError } from "@/data/vfs/IOError";
 import { ArchiveExtractionError } from "@/engine/gameRes/importError/ArchiveExtractionError";
 import { InvalidArchiveError } from "@/engine/gameRes/importError/InvalidArchiveError";
 import { ModManager } from "@/gui/screen/mainMenu/modSel/ModManager";
 import { ModMeta } from "@/gui/screen/mainMenu/modSel/ModMeta";
 import { BadModArchiveError } from "@/gui/screen/mainMenu/modSel/BadModArchiveError";
-import { IniFile } from "data/IniFile";
+import { IniFile } from "@/data/IniFile";
 import { DuplicateModError } from "@/gui/screen/mainMenu/modSel/DuplicateModError";
-import { VirtualFile } from "data/vfs/VirtualFile";
+import { VirtualFile } from "@/data/vfs/VirtualFile";
+import type { ArchiveSource } from "@/data/ArchiveSource";
+import { gamePathKey, gamePathLeaf, normalizeGamePath } from "@/engine/GamePath";
+import sevenZipFactory from "7z-wasm";
 interface MessageBoxApi {
     alert(message: string, buttonText: string): Promise<void>;
     confirm(message: string, confirmText: string, cancelText: string): Promise<boolean>;
@@ -20,6 +23,7 @@ interface Storage {
 }
 interface Directory {
     listEntries(): Promise<string[]>;
+    containsEntry(name: string): Promise<boolean>;
     getOrCreateDirectory(name: string): Promise<Directory>;
     getFileHandles(): AsyncIterable<{
         name: string;
@@ -32,6 +36,7 @@ interface Directory {
 interface EmscriptenFS {
     chdir(path: string): void;
     open(filename: string, flags: string): number;
+    read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number;
     write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number, canOwn: boolean): void;
     close(fd: number): void;
     unlink(filename: string): void;
@@ -47,9 +52,6 @@ interface SevenZipModule {
     FS: EmscriptenFS;
     callMain(args: string[]): void;
 }
-declare const SystemJS: {
-    import(module: string): Promise<any>;
-};
 export class ModImporter {
     private static readonly modFileExtensions = ["mix", "big", "csf", "ini", "art", "rules"];
     private strings: any;
@@ -60,14 +62,26 @@ export class ModImporter {
         this.messageBoxApi = messageBoxApi;
         this.storage = storage;
     }
-    async import(file: File, modDirectory: Directory, overwrite: boolean, onProgress: (message: string) => void): Promise<ModMeta> {
+    async import(file: ArchiveSource, modDirectory: Directory, overwrite: boolean, onProgress: (message: string) => void): Promise<ModMeta | undefined> {
+        try {
+            return await this.importArchive(file, modDirectory, overwrite, onProgress);
+        }
+        finally {
+            await file.dispose?.();
+        }
+    }
+    private async importArchive(file: ArchiveSource, modDirectory: Directory, overwrite: boolean, onProgress: (message: string) => void): Promise<ModMeta | undefined> {
         const strings = this.strings;
         let exitCode: number | undefined;
         let exitError: any;
         let sevenZipModule: SevenZipModule;
         try {
-            const sevenZipFactory = await SystemJS.import("7z-wasm");
-            sevenZipModule = await sevenZipFactory({
+            // The desktop build historically supplied SystemJS globally, but
+            // the Android WebView is a Vite module build. Keep 7-Zip in the
+            // module graph so a locked/background WebView does not need to
+            // fetch a late importer chunk.
+            sevenZipModule = await (sevenZipFactory as any)({
+                locateFile: (path: string) => path === "7zz.wasm" ? "/7zz.wasm" : path,
                 quit: (code: number, error: any) => {
                     exitCode = code;
                     exitError = error;
@@ -76,28 +90,42 @@ export class ModImporter {
         }
         catch (error) {
             if (error instanceof WebAssembly.RuntimeError) {
-                throw new IOError("Couldn't load 7z-wasm", { cause: error });
+                throw new IOError("Couldn't load 7z-wasm", error);
             }
             throw error;
         }
         onProgress(strings.get("ts:import_loading_archive"));
         sevenZipModule.FS.chdir("/tmp");
-        const fileName = file.name;
+        const fileName = gamePathLeaf(file.name);
         try {
-            const arrayBuffer = await file.arrayBuffer();
             const fileDescriptor = sevenZipModule.FS.open(fileName, "w+");
-            sevenZipModule.FS.write(fileDescriptor, new Uint8Array(arrayBuffer), 0, arrayBuffer.byteLength, 0, true);
-            sevenZipModule.FS.close(fileDescriptor);
+            const reader = file.stream().getReader();
+            let offset = 0;
+            try {
+                while (true) {
+                    const chunk = await reader.read();
+                    if (chunk.done) break;
+                    if (!chunk.value?.byteLength) continue;
+                    sevenZipModule.FS.write(fileDescriptor, chunk.value, 0, chunk.value.byteLength, offset, false);
+                    offset += chunk.value.byteLength;
+                }
+            }
+            finally {
+                reader.releaseLock();
+                sevenZipModule.FS.close(fileDescriptor);
+            }
         }
         catch (error) {
             if (error instanceof DOMException) {
-                throw new IOError(`File "${fileName}" could not be read (${error.name})`, { cause: error });
+                throw new IOError(`File "${fileName}" could not be read (${error.name})`, error);
             }
             throw error;
         }
         onProgress(strings.get("ts:import_extracting_archive"));
         await sleep(100);
-        sevenZipModule.callMain(["x", "-ssc-", "-x!*/", fileName, "*.*"]);
+        // `x` preserves archive directories. The old `-x!*/` switch and the
+        // root-only Emscripten listing silently flattened/ignored mod trees.
+        sevenZipModule.callMain(["x", "-ssc-", fileName]);
         if (exitCode) {
             if (exitCode !== 1) {
                 throw new InvalidArchiveError("7-Zip exited with code " + exitCode, { cause: exitError });
@@ -110,14 +138,17 @@ export class ModImporter {
             });
         }
         sevenZipModule.FS.unlink(fileName);
-        let currentNode = sevenZipModule.FS.lookupPath(sevenZipModule.FS.cwd()).node;
-        let extractedFiles = Object.keys(currentNode.contents);
+        let extractedFiles = this.listExtractedFiles(sevenZipModule.FS);
         const modMeta = new ModMeta();
         const cleanup = () => {
-            ({ node: currentNode } = sevenZipModule.FS.lookupPath(sevenZipModule.FS.cwd()));
-            extractedFiles = Object.keys(currentNode.contents);
             for (const filename of extractedFiles) {
-                sevenZipModule.FS.unlink(filename);
+                try {
+                    sevenZipModule.FS.unlink(filename);
+                }
+                catch {
+                    // Cleanup is best-effort; the module is discarded after
+                    // this import and the next import gets a fresh instance.
+                }
             }
         };
         let totalSize = 0;
@@ -132,7 +163,7 @@ export class ModImporter {
                     if (available < totalSize + 1024 * 1024) {
                         await this.messageBoxApi.alert(strings.get("GUI:InstallModStorageFull", available / 1024 / 1024, totalSize / 1024 / 1024), strings.get("GUI:OK"));
                         cleanup();
-                        return modMeta;
+                        return undefined;
                     }
                 }
             }
@@ -143,8 +174,9 @@ export class ModImporter {
         try {
             const existingEntries = await modDirectory.listEntries();
             let modId: string;
-            if (extractedFiles.includes(ModManager.modMetaFileName)) {
-                const metaFile = this.readFileFromEmFs(sevenZipModule.FS, ModManager.modMetaFileName);
+            const metaPath = extractedFiles.find((filename) => gamePathKey(filename) === gamePathKey(ModManager.modMetaFileName));
+            if (metaPath) {
+                const metaFile = this.readFileFromEmFs(sevenZipModule.FS, metaPath);
                 try {
                     modMeta.fromIniFile(new IniFile(metaFile.readAsString("utf-8")));
                 }
@@ -152,34 +184,35 @@ export class ModImporter {
                     throw new BadModArchiveError("Mod meta file is invalid");
                 }
                 modId = modMeta.id!;
-                if (!overwrite && existingEntries.find((entry) => entry.toLowerCase() === modId)) {
+                if (!overwrite && existingEntries.find((entry) => entry.toLowerCase() === modId.toLowerCase())) {
                     throw new DuplicateModError(`A mod with the id "${modMeta.id}" already exists`);
                 }
             }
             else {
-                if (!extractedFiles.some((filename) => ModImporter.modFileExtensions.includes(currentNode.contents[filename].name.toLowerCase().split(".").pop()))) {
+                if (!extractedFiles.some((filename) => ModImporter.modFileExtensions.includes(gamePathLeaf(filename).toLowerCase().split(".").pop()!))) {
                     throw new BadModArchiveError("Archive doesn't contain a valid mod");
                 }
                 if (!(await this.messageBoxApi.confirm(this.strings.get("GUI:ImportModUnsupportedWarn"), this.strings.get("GUI:Continue"), this.strings.get("GUI:Cancel")))) {
                     cleanup();
-                    return modMeta;
+                    return undefined;
                 }
                 modId = await this.promptFolderName(existingEntries);
                 if (!modId) {
                     cleanup();
-                    return modMeta;
+                    return undefined;
                 }
                 modMeta.id = modId;
                 modMeta.name = modId;
             }
-            const targetDirectory = await modDirectory.getOrCreateDirectory(modId);
-            for await (const fileHandle of targetDirectory.getFileHandles()) {
-                await targetDirectory.deleteFile(fileHandle.name);
+            if (await modDirectory.containsEntry(modId)) {
+                await modDirectory.deleteDirectory(modId, true);
             }
+            const targetDirectory = await modDirectory.getOrCreateDirectory(modId);
             for (const filename of extractedFiles) {
                 onProgress(strings.get("ts:import_importing", filename));
                 try {
-                    const virtualFile = this.readFileFromEmFs(sevenZipModule.FS, filename);
+                    const normalizedFilename = normalizeGamePath(filename);
+                    const virtualFile = this.readFileFromEmFs(sevenZipModule.FS, normalizedFilename);
                     await targetDirectory.writeFile(virtualFile);
                 }
                 catch (error) {
@@ -187,7 +220,13 @@ export class ModImporter {
                     throw error;
                 }
                 finally {
-                    sevenZipModule.FS.unlink(filename);
+                    try {
+                        sevenZipModule.FS.unlink(filename);
+                    }
+                    catch {
+                        // The import target may already have failed and
+                        // cleanup is best-effort for the temporary WASM FS.
+                    }
                 }
             }
             return modMeta;
@@ -197,12 +236,43 @@ export class ModImporter {
             throw error;
         }
     }
+    private listExtractedFiles(fs: EmscriptenFS): string[] {
+        const files: string[] = [];
+        const root = fs.lookupPath(fs.cwd()).node;
+        const visit = (node: any, prefix: string) => {
+            for (const [name, child] of Object.entries<any>(node.contents ?? {})) {
+                const path = prefix ? `${prefix}/${name}` : name;
+                const childContents = child?.contents;
+                const isDirectory = childContents && typeof childContents === "object" && !ArrayBuffer.isView(childContents);
+                if (isDirectory) {
+                    visit(child, path);
+                }
+                else {
+                    files.push(path);
+                }
+            }
+        };
+        visit(root, "");
+        return files.sort((a, b) => a.localeCompare(b));
+    }
     private readFileFromEmFs(fs: EmscriptenFS, filename: string): VirtualFile {
         const stat = fs.stat(filename);
         const fd = fs.open(filename, "r");
-        const buffer = new Uint8Array(stat.size);
-        fs.close(fd);
-        return new VirtualFile(filename, buffer);
+        try {
+            const buffer = new Uint8Array(stat.size);
+            let offset = 0;
+            while (offset < buffer.length) {
+                const bytesRead = fs.read(fd, buffer, offset, buffer.length - offset, offset);
+                if (bytesRead <= 0) {
+                    throw new IOError(`Couldn't read extracted file "${filename}"`);
+                }
+                offset += bytesRead;
+            }
+            return VirtualFile.fromBytes(buffer, filename);
+        }
+        finally {
+            fs.close(fd);
+        }
     }
     private async promptFolderName(existingEntries: string[]): Promise<string | undefined> {
         const baseName = "imported-mod";

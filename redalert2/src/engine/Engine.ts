@@ -21,6 +21,7 @@ import { MapList } from './MapList';
 import { HvaFile } from '../data/HvaFile';
 import { MixinRulesType } from '../game/ini/MixinRulesType';
 import { AppLogger } from '../util/logger';
+import { GAME_PROFILES, type GameProfileDescriptor } from './GameProfile';
 type AppLoggerType = typeof AppLogger;
 interface TheaterSettings {
     type: TheaterType;
@@ -201,6 +202,7 @@ export class Engine {
     public static shroudFileName = "shroud.shp";
     public static mixinRulesFileNames = new Map<MixinRulesType, string>().set(MixinRulesType.NoDogEngiKills, "nodogengikills.ini");
     private static activeMod?: string;
+    private static activeProfile: GameProfileDescriptor = GAME_PROFILES.ra2;
     private static modHash?: number;
     private static gameResSource?: GameResSource;
     public static rfs?: RealFileSystem;
@@ -233,7 +235,8 @@ export class Engine {
         rfsInstance.addRootDirectoryHandle(rootHandle);
         return rfsInstance;
     }
-    static async initVfs(rfsInstance: RealFileSystem | undefined, logger: VfsLogger): Promise<VirtualFileSystem> {
+    static async initVfs(rfsInstance: RealFileSystem | undefined, logger: VfsLogger, profile: GameProfileDescriptor = GAME_PROFILES.ra2): Promise<VirtualFileSystem> {
+        this.activeProfile = profile;
         this.vfs = new VirtualFileSystem(rfsInstance, logger);
         this.iniFiles.setVfs(this.vfs);
         this.palettes.setVfs(this.vfs);
@@ -462,28 +465,28 @@ export class Engine {
         }
         const localMapList = new MapList(gameModes);
         if (this.rfs) {
-            const rootDir = this.rfs.getRootDirectory();
-            if (rootDir) {
-                const entries = await rootDir.listEntries();
-                for (const entryName of entries) {
-                    const lowerEntryName = entryName.toLowerCase();
-                    try {
-                        if (lowerEntryName.endsWith(".pkt")) {
-                            const fileData = await this.rfs.openFile(entryName, true);
-                            if (fileData) {
-                                localMapList.addFromIni(new IniFile(fileData));
-                            }
-                        }
-                        else if (this.supportedMapTypes.some((type) => lowerEntryName.endsWith("." + type))) {
-                            const fileData = await this.rfs.openFile(entryName, true);
-                            if (fileData) {
-                                localMapList.addFromMapFile(fileData);
-                            }
+            // RFS can contain the base game, an active mod directory, and a
+            // user map directory. Scan every registered directory so maps
+            // shipped by mods appear in the lobby alongside the bundled map
+            // manifests.
+            for await (const entryName of this.rfs.getEntriesRecursive()) {
+                const lowerEntryName = entryName.toLowerCase();
+                try {
+                    if (lowerEntryName.endsWith(".pkt")) {
+                        const fileData = await this.rfs.openFile(entryName, true);
+                        if (fileData) {
+                            localMapList.addFromIni(new IniFile(fileData));
                         }
                     }
-                    catch (e) {
-                        console.warn(`Couldn't read file "${entryName}" from RFS`, e);
+                    else if (this.supportedMapTypes.some((type) => lowerEntryName.endsWith("." + type))) {
+                        const fileData = await this.rfs.openFile(entryName, true);
+                        if (fileData) {
+                            localMapList.addFromMapFile(fileData);
+                        }
                     }
+                }
+                catch (e) {
+                    console.warn(`Couldn't read file "${entryName}" from RFS`, e);
                 }
             }
         }
@@ -526,6 +529,9 @@ export class Engine {
     }
     static getActiveEngine(): EngineType {
         return this.activeEngine;
+    }
+    static getActiveProfile(): GameProfileDescriptor {
+        return this.activeProfile;
     }
     static getLastTheaterType(): TheaterType | undefined {
         return this.activeTheater?.type;

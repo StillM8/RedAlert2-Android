@@ -23,6 +23,41 @@ const serveGameResDev = (): Plugin => ({
         });
     },
 });
+// Keep the root WASM file used by the Android/iOS shells in lockstep with the
+// 7z JavaScript wrapper. A stale manually-copied binary fails in WebView with
+// an opaque WebAssembly import/link error.
+const syncSevenZipWasm = (): Plugin => ({
+    name: 'sync-seven-zip-wasm',
+    apply: 'build',
+    buildStart() {
+        const source = path.resolve(__dirname, 'node_modules/7z-wasm/7zz.wasm');
+        const target = path.resolve(__dirname, 'public/7zz.wasm');
+        if (fs.existsSync(source)) {
+            fs.copyFileSync(source, target);
+        }
+    },
+});
+// @ffmpeg/ffmpeg is only the browser-side wrapper. Its core is a separate
+// WASM package and the wrapper otherwise defaults to unpkg, which is not
+// available for offline Android/iOS imports. Keep the core same-origin and
+// package it with every web build.
+const syncFfmpegCore = (): Plugin => ({
+    name: 'sync-ffmpeg-core',
+    apply: 'build',
+    buildStart() {
+        const sourceDir = path.resolve(__dirname, 'node_modules/@ffmpeg/core/dist/esm');
+        const targetDir = path.resolve(__dirname, 'public/ffmpeg');
+        const files = ['ffmpeg-core.js', 'ffmpeg-core.wasm'];
+        fs.mkdirSync(targetDir, { recursive: true });
+        for (const file of files) {
+            const source = path.join(sourceDir, file);
+            if (!fs.existsSync(source)) {
+                throw new Error(`Missing @ffmpeg/core asset: ${source}. Install redalert2 dependencies first.`);
+            }
+            fs.copyFileSync(source, path.join(targetDir, file));
+        }
+    },
+});
 const manualHttpsConfig = fs.existsSync('./certs/server.key') && fs.existsSync('./certs/server.crt')
     ? { key: fs.readFileSync('./certs/server.key'), cert: fs.readFileSync('./certs/server.crt') }
     : undefined;
@@ -30,7 +65,7 @@ const manualHttpsConfig = fs.existsSync('./certs/server.key') && fs.existsSync('
 // with the COOP/COEP headers below. Used for embedded-browser dev and the iOS shell.
 const useHttp = !!process.env.RA2_HTTP;
 export default defineConfig({
-    plugins: [react(), serveGameResDev(), ...(manualHttpsConfig || useHttp ? [] : [basicSsl()])],
+    plugins: [react(), serveGameResDev(), syncSevenZipWasm(), syncFfmpegCore(), ...(manualHttpsConfig || useHttp ? [] : [basicSsl()])],
     server: {
         host: '0.0.0.0',
         port: devPort,

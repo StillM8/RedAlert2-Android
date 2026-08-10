@@ -1,10 +1,10 @@
-# Command & Conquer Red Alert 2 + Yuri's Revenge — iPhone & iPad
+# Command & Conquer Red Alert 2 + Yuri's Revenge — iPhone, iPad & Android
 
 <img width="800" height="450" alt="0808" src="https://github.com/user-attachments/assets/c8efcdb7-72c4-47b8-86a7-cecd25eb4ace" />
 
 
-**Red Alert 2 and Yuri's Revenge skirmish running natively on iPhone and
-iPad** — fully in English, with touch controls built for RTS (tap-select,
+**Red Alert 2 and Yuri's Revenge skirmish running natively on iPhone, iPad,
+and Android** — fully in English, with touch controls built for RTS (tap-select,
 drag-box, two-finger map grab, pinch zoom, long-press force-attack),
 mid-match save/load, retail-accurate lighting, and skirmish AI built out on top of Supalosa's
 Chrono Divide bot until you get a different opponent every match: per-match personalities ×
@@ -257,6 +257,44 @@ RA2_TEAM_ID=<your-team-id> ./scripts/build-ios.sh --device   # iPhone/iPad
 
 Find your team id in Xcode → Settings → Accounts. Install the device build
 with `xcrun devicectl device install app --device <id> <path to RA2.app>`.
+
+### Android builds
+
+The Android shell is split into two installable app variants:
+
+| Variant | App | Package ID (debug) |
+|---|---|---|
+| `ra2` | Red Alert 2 | `com.ammaar.ra2android.debug` |
+| `yr` | Yuri's Revenge | `com.ammaar.yurirevengeandroid.debug` |
+
+With the Android SDK and Gradle available, build either variant from the repo
+root:
+
+```sh
+./scripts/build-android.sh --variant ra2
+./scripts/build-android.sh --variant yr
+```
+
+Use `--device` to install and launch the selected variant through `adb`:
+
+```sh
+./scripts/build-android.sh --variant ra2 --device
+./scripts/build-android.sh --variant yr --device
+```
+
+The first launch opens the in-app game-resource setup. Choose **Select folder**
+and select the directory containing the retail files; selecting individual files
+is not sufficient. The Yuri variant requires `langmd.mix`, `multimd.mix`, and
+`ra2md.mix` in addition to the Red Alert 2 files.
+
+The [v0.0.1 Android release](https://github.com/StillM8/RedAlert2-Android/releases/tag/v0.0.1)
+includes separate release APKs for Red Alert 2 and Yuri's Revenge. Retail game
+files are not bundled; import your legally-owned installation on first launch.
+During the first import, the Android client converts the retail Bink menu movie
+to WebM and stores it with the imported files. Later launches reuse that file.
+
+Returning to any app from Home or Android Back preserves the existing WebView
+and game session instead of booting a new session.
 
 Desktop development (no Xcode needed):
 

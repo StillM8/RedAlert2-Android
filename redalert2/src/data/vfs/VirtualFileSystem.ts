@@ -7,6 +7,7 @@ import { FileNotFoundError } from "./FileNotFoundError";
 import { MemArchive } from "./MemArchive";
 import type { VirtualFile } from "./VirtualFile";
 import type { RealFileSystem } from "./RealFileSystem";
+import { normalizeGamePath } from "../../engine/GamePath";
 interface VfsLogger {
     info(message: string, ...args: unknown[]): void;
     warn(message: string, ...args: unknown[]): void;
@@ -15,6 +16,7 @@ interface VfsLogger {
 interface Archive {
     containsFile(filename: string): boolean;
     openFile(filename: string): VirtualFile;
+    listFiles?: () => string[];
 }
 export class VirtualFileSystem {
     private rfs: RealFileSystem;
@@ -27,18 +29,26 @@ export class VirtualFileSystem {
         this.allArchives = new Map<string, Archive>();
         this.archivesByPriority = [];
     }
-    fileExists(filename: string): boolean {
+    private containsFileDirect(filename: string): boolean {
+        const normalized = normalizeGamePath(filename);
         for (const archive of this.archivesByPriority) {
-            if (archive.containsFile(filename)) {
+            if (archive.containsFile(normalized)) {
                 return true;
             }
         }
         return false;
     }
+    private resolveFilename(filename: string): string {
+        return normalizeGamePath(filename);
+    }
+    fileExists(filename: string): boolean {
+        return this.containsFileDirect(this.resolveFilename(filename));
+    }
     openFile(filename: string): VirtualFile {
+        const resolvedFilename = this.resolveFilename(filename);
         for (const archive of this.archivesByPriority) {
-            if (archive.containsFile(filename)) {
-                return archive.openFile(filename);
+            if (archive.containsFile(resolvedFilename)) {
+                return archive.openFile(resolvedFilename);
             }
         }
         throw new FileNotFoundError(`File "${filename}" not found in VFS`);
@@ -70,11 +80,21 @@ export class VirtualFileSystem {
     listArchives(): string[] {
         return [...this.allArchives.keys()];
     }
+    listFiles(): string[] {
+        const files = new Set<string>();
+        for (const archive of this.archivesByPriority) {
+            for (const filename of archive.listFiles?.() ?? []) {
+                files.add(filename);
+            }
+        }
+        return [...files];
+    }
     debugListFileOwners(filename: string): string[] {
         const owners: string[] = [];
+        const normalized = normalizeGamePath(filename);
         this.allArchives.forEach((archive, name) => {
             try {
-                if (archive.containsFile(filename))
+                if (archive.containsFile(normalized))
                     owners.push(name);
             }
             catch {
@@ -200,7 +220,7 @@ export class VirtualFileSystem {
     async loadExtraMixFiles(engineType: EngineType): Promise<void> {
         this.logger.info("Loading extra mix files...");
         const rfsEntries = new Set<string>();
-        for await (const entry of this.rfs.getEntries()) {
+        for await (const entry of this.rfs.getEntriesRecursive()) {
             rfsEntries.add(entry.toLowerCase());
         }
         const prefixes = ["ecache", "expand", "elocal"];
@@ -251,7 +271,7 @@ export class VirtualFileSystem {
         const extensionsToLoad = ["ini", "csf"];
         const excludeSet = new Set<string>((options?.exclude || []).map(f => f.toLowerCase()));
         const filesForMemArchive: VirtualFile[] = [];
-        for await (const entryName of this.rfs.getEntries()) {
+        for await (const entryName of this.rfs.getEntriesRecursive()) {
             const lowerEntryName = entryName.toLowerCase();
             if (extensionsToLoad.some((ext) => lowerEntryName.endsWith("." + ext)) &&
                 !excludeSet.has(lowerEntryName)) {

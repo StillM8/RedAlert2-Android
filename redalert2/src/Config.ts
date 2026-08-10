@@ -67,7 +67,7 @@ export class Config {
     get serversUrl(): string {
         return this.generalData.getString("serversUrl", "servers.ini");
     }
-    /** "ra2" (default) or "yr" — which game the engine boots as. */
+    /** "ra2" or "yr" — which simulation engine is booting. */
     get engine(): string {
         return this.generalData.getString("engine") || "ra2";
     }
